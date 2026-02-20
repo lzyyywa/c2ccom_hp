@@ -20,4 +20,5 @@ parser.add_argument("--gradient_accumulation_steps",help="number of gradient acc
 
 parser.add_argument("--logpath",default='/mnt/fast/nobackup/users/rl01003/ex_ideas/com_vlm/log/Discrete_condition_v2/tsm18/10/',type=str)
 
-
+parser.add_argument("--obj_hierarchy_path", type=str, default="./data_split/hierarchy/obj_hierarchy.json", help="path to object hierarchy json")
+parser.add_argument("--verb_hierarchy_path", type=str, default="./data_split/hierarchy/verb_hierarchy.json", help="path to verb hierarchy json")

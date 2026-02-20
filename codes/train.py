@@ -76,22 +76,27 @@ if __name__ == "__main__":
                                             aux_input=config.aux_input,
                                             ade_input=config.ade_input,
                                             frames_duration=config.num_frames,
-                                            use_composed_pair_loss=use_composed_pair_loss)
+                                            use_composed_pair_loss=use_composed_pair_loss,
+                                            obj_hierarchy_path=config.obj_hierarchy_path,
+                                            verb_hierarchy_path=config.verb_hierarchy_path)
 
     val_dataset = CompositionVideoDataset(dataset_path,
                                           phase='val',
                                           split='compositional-split-natural',
                                           tdn_input='tdn' in config.arch,
                                           frames_duration=config.num_frames,
-                                          use_composed_pair_loss=use_composed_pair_loss
-                                          )
+                                          use_composed_pair_loss=use_composed_pair_loss,
+                                          obj_hierarchy_path=config.obj_hierarchy_path,
+                                          verb_hierarchy_path=config.verb_hierarchy_path)
 
     test_dataset = CompositionVideoDataset(dataset_path,
                                            phase='test',
                                            split='compositional-split-natural',
                                            tdn_input='tdn' in config.arch,
                                            frames_duration=config.num_frames,
-                                           use_composed_pair_loss=use_composed_pair_loss)
+                                           use_composed_pair_loss=use_composed_pair_loss,
+                                           obj_hierarchy_path=config.obj_hierarchy_path,
+                                           verb_hierarchy_path=config.verb_hierarchy_path)
 
     model = get_model(train_dataset, config)
     optimizer = get_optimizer(config, model)

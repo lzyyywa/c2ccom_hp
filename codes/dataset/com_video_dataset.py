@@ -85,7 +85,9 @@ class CompositionVideoDataset(Dataset):
             ade_input=False,
             return_n_matrix=True,
             test_json='test_pairs.json',
-            ex_test_json='test_pairs.json'
+            ex_test_json='test_pairs.json',
+            obj_hierarchy_path='./data_split/hierarchy/obj_hierarchy.json',
+            verb_hierarchy_path='./data_split/hierarchy/verb_hierarchy.json'
     ):
         self.root = root
         self.phase = phase
@@ -96,6 +98,13 @@ class CompositionVideoDataset(Dataset):
         self.test_json=test_json
         self.val_json='val_pairs.json'
         self.ex_test_json=ex_test_json
+
+        self.obj_hierarchy_path = obj_hierarchy_path
+        self.verb_hierarchy_path = verb_hierarchy_path
+        with open(self.obj_hierarchy_path, 'r') as f:
+            self.obj_hierarchy = json.load(f)
+        with open(self.verb_hierarchy_path, 'r') as f:
+            self.verb_hierarchy = json.load(f)
 
         # todo about video sampling #230612:seems done
         self.tdn_input = tdn_input
@@ -277,7 +286,7 @@ class CompositionVideoDataset(Dataset):
         :param frame_idx: index
         :return:
         """
-        return Image.open(ospj(self.root, vid_name, '%06d.jpg' % (frame_idx))).convert('RGB')
+        return Image.open(ospj(self.root, vid_name, '%04d.jpg' % (frame_idx))).convert('RGB')
 
     def _sample_indices(self, id):
         if not self.tdn_input:
@@ -365,7 +374,6 @@ class CompositionVideoDataset(Dataset):
         while new_attr == attr and new_obj == obj:
             new_attr, new_obj = self.train_pairs[np.random.choice(
                 len(self.train_pairs))]
-
 
         return [self.attr2idx[new_attr], self.obj2idx[new_obj]]
 
@@ -470,9 +478,14 @@ class CompositionVideoDataset(Dataset):
         id, attr, obj = self.data[index]
         vid = self._load_video(id)
         vid = self.transform(vid)
+
+        coarse_attr = self.verb_hierarchy.get(attr, attr)
+        coarse_obj = self.obj_hierarchy.get(obj, obj)
+
         if self.phase == 'train':
             data = [
-                vid, self.attr2idx[attr], self.obj2idx[obj], self.train_pair_to_idx[(attr, obj)]
+                vid, self.attr2idx[attr], self.obj2idx[obj], self.train_pair_to_idx[(attr, obj)],
+                coarse_attr, coarse_obj
             ]
 
             if self.return_n_matrix:
@@ -527,10 +540,10 @@ class CompositionVideoDataset(Dataset):
 
                     data.extend([composed_seen_pair, composed_unseen_pair, mask_task])
 
-
         else:
             data = [
-                vid, self.attr2idx[attr], self.obj2idx[obj], self.pair2idx[(attr, obj)]
+                vid, self.attr2idx[attr], self.obj2idx[obj], self.pair2idx[(attr, obj)],
+                coarse_attr, coarse_obj
             ]
 
         return data

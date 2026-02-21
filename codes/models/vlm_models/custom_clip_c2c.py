@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
+import math
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 from models.vlm_models.text_learner import get_text_learner
+from models.vlm_models import lorentz as L  # Imported hyperbolic mathematical operations
 
 import torch.nn.functional as F
 
@@ -141,7 +143,6 @@ class VideoEncoder(nn.Module):
             out = out @ self.clip_proj
         out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)#be annotated
 
-
         return out
 
 
@@ -160,6 +161,19 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
         # self.dtype = clip_model.dtype
+
+        # ======== Hyperbolic parameters initialization ========
+        # Initialize learnable curvature parameter.
+        self.curv = nn.Parameter(torch.tensor(1.0).log(), requires_grad=True)
+        # Min and max limits for curvature to ensure training stability
+        self._curv_minmax = {
+            "max": math.log(10.0),
+            "min": math.log(0.1),
+        }
+        # Learnable scalars to ensure unit norm before exponential map
+        self.visual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim**-0.5).log())
+        self.textual_alpha = nn.Parameter(torch.tensor(cfg.emb_dim**-0.5).log())
+        # ====================================================
 
         # ======== C2C part =====
         try:
@@ -186,7 +200,6 @@ class CustomCLIP(nn.Module):
         self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
                               dropout=False,
                               norm=True, layers=layers)
-
 
         self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)  # TODO
         self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)  # TODO
@@ -216,19 +229,18 @@ class CustomCLIP(nn.Module):
         verb_text_features_norm = verb_text_features / verb_text_features.norm(dim=-1, keepdim=True)
         obj_text_features_norm = obj_text_features / obj_text_features.norm(dim=-1, keepdim=True)
 
-        verb_logits = v_feat_normed @ verb_text_features_norm.t()
-        obj_logits = o_feat_normed @ obj_text_features_norm.t()
+        # Euclidean logits (preserved strictly for the condition module to maintain baseline logic)
+        verb_logits_eucl = v_feat_normed @ verb_text_features_norm.t()
+        obj_logits_eucl = o_feat_normed @ obj_text_features_norm.t()
 
-
-        verb_logits = verb_logits * 0.5 + 0.5
-        obj_logits = obj_logits * 0.5 + 0.5
-
+        verb_logits_prob = verb_logits_eucl * 0.5 + 0.5
+        obj_logits_prob = obj_logits_eucl * 0.5 + 0.5
 
         # ===condition learning===
         b = video_features.shape[0]
         c = verb_text_features.shape[-1]
-        n_v = verb_logits.shape[-1]
-        n_o = obj_logits.shape[-1]
+        n_v = verb_logits_prob.shape[-1]
+        n_o = obj_logits_prob.shape[-1]
 
         # visual features
         o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
@@ -237,12 +249,33 @@ class CustomCLIP(nn.Module):
 
         p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b,
                                                      c, n_v)
-        p_pair_o = p_v_con_o * obj_logits.unsqueeze(1)  # b,nv,no
-        p_pair_v = p_o_con_v * verb_logits.unsqueeze(-1)  # b,nv,no
+        
+        # Use Euclidean probability logits for pair generation to preserve C2C foundation
+        p_pair_o = p_v_con_o * obj_logits_prob.unsqueeze(1)  # b,nv,no
+        p_pair_v = p_o_con_v * verb_logits_prob.unsqueeze(-1)  # b,nv,no
 
+        # ======== Hyperbolic Mapping and Distances ========
+        # Clamp curvature and scale factors
+        self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
+        _curv = self.curv.exp()
+        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
+        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
+
+        with torch.autocast(video_features.device.type, dtype=torch.float32):
+            # Scale features and map to Hyperbolic space (Lorentz Model)
+            v_feat_hyp = L.exp_map0(v_feat * self.visual_alpha.exp(), _curv)
+            o_feat_hyp = L.exp_map0(o_feat * self.visual_alpha.exp(), _curv)
+            verb_text_hyp = L.exp_map0(verb_text_features * self.textual_alpha.exp(), _curv)
+            obj_text_hyp = L.exp_map0(obj_text_features * self.textual_alpha.exp(), _curv)
+
+            # Compute Hyperbolic Logits (Negative Distance)
+            verb_logits_hyp = -L.pairwise_dist(v_feat_hyp, verb_text_hyp, _curv)
+            obj_logits_hyp = -L.pairwise_dist(o_feat_hyp, obj_text_hyp, _curv)
+        # ====================================================
 
         if self.training:
-            return verb_logits, obj_logits, p_pair_v, p_pair_o, video_features, o_feat, v_feat, p_v_con_o, p_o_con_v
+            # Return hyp logits for basic contrastive loss, and output hyp features for later hierarchical loss
+            return verb_logits_hyp, obj_logits_hyp, p_pair_v, p_pair_o, video_features, o_feat, v_feat, p_v_con_o, p_o_con_v, v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv
         else:
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
@@ -324,7 +357,7 @@ def build_model(train_dataset,cfg):
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
                 print(f'{name}: {param.requires_grad}')
-        elif 'c2c' in name:
+        elif 'c2c' in name or 'curv' in name or 'alpha' in name: # Added curv and alpha to ensure they get updated
             param.requires_grad = True
             print(f'{name}: {param.requires_grad}')
     return model

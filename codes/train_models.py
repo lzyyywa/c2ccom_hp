@@ -135,20 +135,34 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
         for bid, batch in enumerate(train_dataloader):
+            batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
-            batch_img = batch[0].cuda()
+            
+            # --- Added: Extract coarse texts for later hierarchical loss calculation ---
+            batch_coarse_verb = batch[4]
+            batch_coarse_obj = batch[5]
+            # --------------------------------------------------------------------------
+
             with torch.cuda.amp.autocast(enabled=True):
-                p_v, p_o, p_pair_v, p_pair_o, vid_feat, v_feat, o_feat, p_v_con_o, p_o_con_v = model(batch_img)
-                # component loss
-                loss_verb = Loss_fn(p_v * config.cosine_scale, batch_verb)
-                loss_obj = Loss_fn(p_o * config.cosine_scale, batch_obj)
+                # --- Modified: Unpack 14 outputs including hyperbolic features and curv ---
+                p_v_hyp, p_o_hyp, p_pair_v, p_pair_o, vid_feat, o_feat, v_feat, p_v_con_o, p_o_con_v, \
+                v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
+                
+                # component loss using hyperbolic logits (negative distances)
+                loss_verb = Loss_fn(p_v_hyp * config.cosine_scale, batch_verb)
+                loss_obj = Loss_fn(p_o_hyp * config.cosine_scale, batch_obj)
+                # --------------------------------------------------------------------------
+                
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 pred_com_train = (p_pair_v + p_pair_o)[:, train_v_inds, train_o_inds]
                 loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
+                
+                # --- Base Euclidean structure is strictly preserved here ---
                 loss = loss_com + 0.2 * (loss_verb + loss_obj)
-
+                # Hierarchical and alignment losses will be added here in the next step.
+                
                 loss = loss / config.gradient_accumulation_steps
 
             # Accumulates scaled gradients.
@@ -336,7 +350,9 @@ def c2c_enhance(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     batch_img[:, :, :, bbx1:bbx2, bby1:bby2] = batch_img[rand_index, :, :, bbx1:bbx2, bby1:bby2]
                     # adjust lambda to exactly match pixel ratio
                     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (batch_img.size()[-1] * batch_img.size()[-2]))
-                    p_v, p_o, p_pair_v, p_pair_o, vid_feat, v_feat, o_feat, p_v_con_o, p_o_con_v = model(batch_img)
+                    
+                    # --- Modified: Appended *_ to prevent unpacking error due to new outputs ---
+                    p_v, p_o, p_pair_v, p_pair_o, vid_feat, v_feat, o_feat, p_v_con_o, p_o_con_v, *_ = model(batch_img)
 
                     # component loss
                     loss_verb = Loss_fn(p_v * config.cosine_scale, target_v_a) * lam + Loss_fn(
@@ -375,7 +391,9 @@ def c2c_enhance(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     loss_con_train = torch.tensor([0.0]).cuda()
 
                 else:
-                    p_v, p_o, p_pair_v, p_pair_o, vid_feat, v_feat, o_feat, p_v_con_o, p_o_con_v = model(batch_img)
+                    # --- Modified: Appended *_ to prevent unpacking error due to new outputs ---
+                    p_v, p_o, p_pair_v, p_pair_o, vid_feat, v_feat, o_feat, p_v_con_o, p_o_con_v, *_ = model(batch_img)
+                    
                     # component loss
                     loss_verb = Loss_fn(p_v * config.cosine_scale, batch_verb)
                     loss_obj = Loss_fn(p_o * config.cosine_scale, batch_obj)

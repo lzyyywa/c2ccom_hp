@@ -147,13 +147,11 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # ======== 双曲切空间投影头 ========
         self.hyp_proj_v_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_o_vis = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_v_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         self.hyp_proj_o_text = nn.Linear(cfg.emb_dim, cfg.emb_dim)
         
-        # [严防休克] 强制初始化为单位矩阵
         nn.init.eye_(self.hyp_proj_v_vis.weight)
         nn.init.zeros_(self.hyp_proj_v_vis.bias)
         nn.init.eye_(self.hyp_proj_o_vis.weight)
@@ -178,7 +176,6 @@ class CustomCLIP(nn.Module):
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        # [严防死守: 清理所有潜在的 NaN 和除以 0]
         o_feat_normed = torch.nan_to_num(F.normalize(o_feat, dim=1, eps=1e-5))
         v_feat_normed = torch.nan_to_num(F.normalize(v_feat, dim=1, eps=1e-5))
 
@@ -188,8 +185,8 @@ class CustomCLIP(nn.Module):
         obj_text_features_norm = obj_text_features / (obj_text_features.norm(dim=-1, keepdim=True) + 1e-5)
         obj_text_features_norm = torch.nan_to_num(obj_text_features_norm)
 
-        verb_logits_eucl = v_feat_normed @ verb_text_features_norm.t()
-        obj_logits_eucl = o_feat_normed @ obj_text_features_norm.t()
+        verb_logits_eucl = torch.nan_to_num(v_feat_normed @ verb_text_features_norm.t())
+        obj_logits_eucl = torch.nan_to_num(o_feat_normed @ obj_text_features_norm.t())
 
         verb_logits_prob = verb_logits_eucl * 0.5 + 0.5
         obj_logits_prob = obj_logits_eucl * 0.5 + 0.5
@@ -199,8 +196,9 @@ class CustomCLIP(nn.Module):
         n_v = verb_logits_prob.shape[-1]
         n_o = obj_logits_prob.shape[-1]
 
-        o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
-        v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
+        # [最后一块防弹衣]: 给推断区的原始特征加上保护
+        o_feat_c = torch.nan_to_num(self.c2c_OE2(video_features.mean(dim=-1)))
+        v_feat_c = torch.nan_to_num(self.c2c_VE2(video_features).mean(dim=-1))
 
         p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b, c, n_v)
         p_pair_o = p_v_con_o * obj_logits_prob.unsqueeze(1)  
@@ -233,21 +231,23 @@ class CustomCLIP(nn.Module):
             return com_logits
 
     def condition_module(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
-        v_emb_normed = F.normalize(v_emb, dim=1)
-        o_emb_normed = F.normalize(o_emb, dim=1)
+        # [彻底封死欧式推理区溢出]
+        v_emb_normed = torch.nan_to_num(F.normalize(v_emb, dim=1, eps=1e-5))
+        o_emb_normed = torch.nan_to_num(F.normalize(o_emb, dim=1, eps=1e-5))
 
         f_v_e_o = self.c2c_f_v_e_o_com(
             torch.cat([v_feat_c.unsqueeze(1).repeat(1, n_o, 1), o_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2)) 
-        f_v_e_o_norm = F.normalize(f_v_e_o, dim=-1).view(b, n_o, c)
+        f_v_e_o_norm = torch.nan_to_num(F.normalize(f_v_e_o, dim=-1, eps=1e-5)).view(b, n_o, c)
 
         f_o_e_v = self.c2c_f_o_e_v_com(
             torch.cat([o_feat_c.unsqueeze(1).repeat(1, n_v, 1), v_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2)) 
-        f_o_e_v_norm = F.normalize(f_o_e_v, dim=-1).view(b, n_v, c)
+        f_o_e_v_norm = torch.nan_to_num(F.normalize(f_o_e_v, dim=-1, eps=1e-5)).view(b, n_v, c)
 
         p_v_con_o = torch.einsum('bnc,mc->bnm', f_v_e_o_norm, v_emb_normed) * 0.5 + 0.5  
         p_v_con_o = p_v_con_o.permute(0, 2, 1)  
         p_o_con_v = torch.einsum('bnc,mc->bnm', f_o_e_v_norm, o_emb_normed) * 0.5 + 0.5  
-        return p_v_con_o, p_o_con_v
+        
+        return torch.nan_to_num(p_v_con_o), torch.nan_to_num(p_o_con_v)
 
 
 def load_clip_to_cpu(cfg):

@@ -172,14 +172,22 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             # 1. 允许欧式空间的计算在 FP16 (AMP) 下进行
             # -------------------------------------------------------------------------
             with torch.cuda.amp.autocast(enabled=True):
-                p_v_hyp, p_o_hyp, p_pair_v, p_pair_o, vid_feat, o_feat, v_feat, p_v_con_o, p_o_con_v, \
+                # [关键修复] 接收前向传播返回的双轨参数：_eucl 保基线，_hyp 做正则
+                verb_logits_eucl, obj_logits_eucl, verb_logits_hyp, obj_logits_hyp, p_pair_v, p_pair_o, vid_feat, o_feat, v_feat, p_v_con_o, p_o_con_v, \
                 v_feat_hyp, o_feat_hyp, verb_text_hyp, obj_text_hyp, _curv = model(batch_img)
                 
-                # 组合模块输出的是欧式特征，严格保留欧式交叉熵与 100倍缩放！
+                # ====== 欧式基线托底区 (保证 C2C 能力不跌) ======
+                loss_verb_eucl = Loss_fn(verb_logits_eucl * config.cosine_scale, batch_verb)
+                loss_obj_eucl = Loss_fn(obj_logits_eucl * config.cosine_scale, batch_obj)
+                
                 train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                 pred_com_train = (p_pair_v + p_pair_o)[:, train_v_inds, train_o_inds]
                 loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
                 
+                w_att_obj = config.att_obj_w
+                loss_eucl_base = loss_com + w_att_obj * (loss_verb_eucl + loss_obj_eucl)
+                
+                # ====== 提取粗粒度特征 (欧式切空间) ======
                 coarse_v_raw = torch.cat([coarse_v_feats_dict[cv] for cv in batch_coarse_verb], dim=0).cuda()
                 coarse_o_raw = torch.cat([coarse_o_feats_dict[co] for co in batch_coarse_obj], dim=0).cuda()
                 
@@ -187,35 +195,30 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 coarse_o_eucl = actual_model.c2c_text_o(coarse_o_raw)
                 
             # -------------------------------------------------------------------------
-            # 2. 强制退出半精度，所有双曲运算和映射必须在 FP32 下进行，防止 NaN
+            # 2. 强制退出半精度，执行双曲增强与结构正则化 (FP32)
             # -------------------------------------------------------------------------
             with torch.cuda.amp.autocast(enabled=False):
-                # 双曲负距离 Logit 使用安全温度缩放 20.0
-                loss_verb = Loss_fn(p_v_hyp.float() * 20.0, batch_verb)
-                loss_obj = Loss_fn(p_o_hyp.float() * 20.0, batch_obj)
-                
-                # 显式转换为 float32
                 _curv_fp32 = _curv.float()
                 v_alpha_fp32 = actual_model.textual_alpha.exp().float()
-                coarse_v_eucl_fp32 = coarse_v_eucl.float()
-                coarse_o_eucl_fp32 = coarse_o_eucl.float()
+                
+                # [关键修复] 粗粒度特征必须经过相同的切空间投影头，防止几何冲突
+                coarse_v_tangent = actual_model.hyp_proj_v_text(coarse_v_eucl.float())
+                coarse_o_tangent = actual_model.hyp_proj_o_text(coarse_o_eucl.float())
                 
                 import models.vlm_models.lorentz as L
-                coarse_v_hyp = L.exp_map0(coarse_v_eucl_fp32 * v_alpha_fp32, _curv_fp32)
-                coarse_o_hyp = L.exp_map0(coarse_o_eucl_fp32 * v_alpha_fp32, _curv_fp32)
+                coarse_v_hyp = L.exp_map0(coarse_v_tangent * v_alpha_fp32, _curv_fp32)
+                coarse_o_hyp = L.exp_map0(coarse_o_tangent * v_alpha_fp32, _curv_fp32)
                 
                 batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
                 batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
                 v_feat_hyp_fp32 = v_feat_hyp.float()
                 o_feat_hyp_fp32 = o_feat_hyp.float()
                 
-                # =====================================================================
-                # [HYPERBOLIC LOSS] 实例化并调用纯净的公式类
-                # =====================================================================
+                # ====== 实例化双曲公式 ======
                 entail_loss_fn = EntailmentConeLoss(margin=0.01)
                 align_loss_fn = HyperbolicHardNegativeAlignmentLoss(margin=0.2)
                 
-                # 层次蕴含损失 (Entailment)
+                # 层次蕴含损失 (Entailment: 子节点 -> 父节点)
                 loss_ent_v = entail_loss_fn(batch_fine_v_hyp, coarse_v_hyp, _curv_fp32)
                 loss_ent_o = entail_loss_fn(batch_fine_o_hyp, coarse_o_hyp, _curv_fp32)
                 loss_ent_vid_v = entail_loss_fn(v_feat_hyp_fp32, batch_fine_v_hyp, _curv_fp32)
@@ -223,22 +226,25 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
                 loss_entailment = loss_ent_v + loss_ent_o + loss_ent_vid_v + loss_ent_vid_o
                 
-                # 判别对齐损失 (Alignment)
-                loss_align_v = align_loss_fn(p_v_hyp.float(), batch_verb)
-                loss_align_o = align_loss_fn(p_o_hyp.float(), batch_obj)
+                # 判别对齐损失 (Alignment: 拉开难负样本距离)
+                loss_align_v = align_loss_fn(verb_logits_hyp.float(), batch_verb)
+                loss_align_o = align_loss_fn(obj_logits_hyp.float(), batch_obj)
                 
                 loss_alignment = loss_align_v + loss_align_o
                 
-                # =====================================================================
-                # 显式提取配置权重 (强制 Fail-Fast 机制，无默认值！)
-                # =====================================================================
-                w_att_obj = config.att_obj_w
+                # 双曲空间的交叉熵 (作为辅助分类正则化，使用安全的温度系数20.0)
+                loss_verb_hyp = Loss_fn(verb_logits_hyp.float() * 20.0, batch_verb)
+                loss_obj_hyp = Loss_fn(obj_logits_hyp.float() * 20.0, batch_obj)
+                
+                # ====== 终极融合：欧式基线 + 双曲正则 ======
                 w_align = config.lambda_align
                 w_entail = config.lambda_entail
 
-                # 统一为 FP32 计算最终 loss
-                loss_base = loss_com.float() + w_att_obj * (loss_verb + loss_obj)
-                loss = loss_base + w_entail * loss_entailment + w_align * loss_alignment
+                # 双曲辅助损失 = 双曲分类 + 层次蕴含 + 难负样本排斥
+                loss_hyp_aux = w_att_obj * (loss_verb_hyp + loss_obj_hyp) + w_entail * loss_entailment + w_align * loss_alignment
+                
+                # 混合流形总损失
+                loss = loss_eucl_base + loss_hyp_aux
                 
                 loss = loss / config.gradient_accumulation_steps
 
@@ -259,8 +265,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             epoch_train_losses.append(loss.item())
             epoch_com_losses.append(loss_com.item())
-            epoch_vv_losses.append(loss_verb.item())
-            epoch_oo_losses.append(loss_obj.item())
+            # 记录欧式 loss 以监控基线表现
+            epoch_vv_losses.append(loss_verb_eucl.item())
+            epoch_oo_losses.append(loss_obj_eucl.item())
             
             epoch_ent_losses.append(loss_entailment.item())
             epoch_ali_losses.append(loss_alignment.item())

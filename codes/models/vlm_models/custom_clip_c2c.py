@@ -251,10 +251,10 @@ class CustomCLIP(nn.Module):
 
         with torch.autocast(video_features.device.type, dtype=torch.float32):
             # 1. 经过切空间投影头，完成流形转换过渡
-            v_feat_tangent = self.hyp_proj_v_vis(v_feat.float())
-            o_feat_tangent = self.hyp_proj_o_vis(o_feat.float())
-            verb_text_tangent = self.hyp_proj_v_text(verb_text_features.float())
-            obj_text_tangent = self.hyp_proj_o_text(obj_text_features.float())
+            v_feat_tangent = self.hyp_proj_v_vis(v_feat_normed.float())
+            o_feat_tangent = self.hyp_proj_o_vis(o_feat_normed.float())
+            verb_text_tangent = self.hyp_proj_v_text(verb_text_features_norm.float())
+            obj_text_tangent = self.hyp_proj_o_text(obj_text_features_norm.float())
 
             # 2. 指数映射到洛伦兹模型
             v_feat_hyp = L.exp_map0(v_feat_tangent * self.visual_alpha.exp().float(), _curv)

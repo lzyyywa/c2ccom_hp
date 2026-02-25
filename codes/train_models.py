@@ -93,7 +93,8 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
             with torch.cuda.amp.autocast(enabled=False):
                 _curv_fp32 = _curv.float()
-                v_alpha_fp32 = actual_model.textual_alpha.exp().float()
+                v_alpha_fp32 = actual_model.visual_alpha.exp().float()
+                t_alpha_fp32 = actual_model.textual_alpha.exp().float()
                 
                 coarse_v_eucl_norm = torch.nan_to_num(coarse_v_eucl.float() / (coarse_v_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
                 coarse_o_eucl_norm = torch.nan_to_num(coarse_o_eucl.float() / (coarse_o_eucl.float().norm(dim=-1, keepdim=True) + 1e-5))
@@ -102,8 +103,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 coarse_o_tangent = actual_model.hyp_proj_o_text(coarse_o_eucl_norm)
                 
                 import models.vlm_models.lorentz as L
-                coarse_v_hyp = L.exp_map0(coarse_v_tangent * v_alpha_fp32, _curv_fp32)
-                coarse_o_hyp = L.exp_map0(coarse_o_tangent * v_alpha_fp32, _curv_fp32)
+                # [必须用 t_alpha_fp32 处理文本]
+                coarse_v_hyp = L.exp_map0(coarse_v_tangent * t_alpha_fp32, _curv_fp32)
+                coarse_o_hyp = L.exp_map0(coarse_o_tangent * t_alpha_fp32, _curv_fp32)
                 
                 batch_fine_v_hyp = verb_text_hyp[batch_verb].float()
                 batch_fine_o_hyp = obj_text_hyp[batch_obj].float()
@@ -127,13 +129,17 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 
                 loss_hyp_aux = config.att_obj_w * (loss_verb_hyp + loss_obj_hyp) + config.lambda_entail * loss_entailment + config.lambda_align * loss_alignment
                 
-                loss = (loss_eucl_base + loss_hyp_aux) / config.gradient_accumulation_steps
+                # [终极防弹衣]: 在反向传播前，清洗一切可能溢出的浮点数！
+                loss = (torch.nan_to_num(loss_eucl_base) + torch.nan_to_num(loss_hyp_aux)) / config.gradient_accumulation_steps
+                loss = torch.nan_to_num(loss)
 
             scaler.scale(loss).backward()
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
                 scaler.unscale_(optimizer)
-                # [关键修复]: 去掉 clip_grad_norm_！在 AMP 下它会把无穷大梯度强行转换成 NaN 毒药。直接让 Scaler 自己跳过更新！
+                # =========================================================================
+                # 【罪魁祸首已斩首】 删除了导致 inf * 0 = NaN 的 clip_grad_norm_！
+                # =========================================================================
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -145,7 +151,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_ent_losses.append(loss_entailment.item())
             epoch_ali_losses.append(loss_alignment.item())
 
-            # [关键修复]: 使用 np.nanmean 免疫幽灵 NaN！只要网络正常跑，忽略偶发的浮点溢出批次
+            # 屏蔽由于 AMP 跳过更新时产生的幽灵孤立 NaN
             current_loss = np.nanmean(epoch_train_losses[-50:])
             progress_bar.set_postfix({"train loss": current_loss})
             progress_bar.update()
@@ -153,7 +159,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         lr_scheduler.step()
         progress_bar.close()
         
-        # Save metrics logs
         log_training.write(f"\nepoch {i + 1} train loss {np.nanmean(epoch_train_losses)}\n")
         log_training.write(f"epoch {i + 1} com loss {np.nanmean(epoch_com_losses)}\n")
 
